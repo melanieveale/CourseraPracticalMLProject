@@ -1,0 +1,271 @@
+---
+title: "Weight Lifting Wearables Project"
+output: html_document
+---
+
+The goal of this project is to predict "how" subjects are performing a weight lifting exercise,
+i.e. the "classe" variable A, B, C, D, E.
+These represent different ways of performing the exercise,
+correctly or with certain common mistakes.
+
+# Prerequisites
+#### Install packages
+```{r message = FALSE, warning=FALSE}
+library(tidyverse)
+library(caret)
+library(dplyr)
+```
+
+#### Download data
+```{r}
+data_folder = '/domino/datasets/local/R-learning-sandbox/'
+training_url = 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv'
+testing_url = 'https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv'
+training_file = file.path(data_folder, "pml-training.csv")
+testing_file = file.path(data_folder, "pml-testing.csv")
+download.file(training_url, training_file)
+download.file(testing_url, testing_file)
+```
+
+# Explore the data
+
+#### Read Data
+```{r}
+training_data = read.csv(training_file, na.strings=c("", "NA"), row.names = "X")
+testing_data = read.csv(testing_file, na.strings=c("", "NA"), row.names = "X")
+```
+
+#### Look at column NAs
+```{r}
+no_na_col_lists = c()
+for (d in c("training", "testing")) {
+  if (d == "training") current_data = training_data
+  else current_data = testing_data
+  data_dim = dim(current_data)
+  print(sprintf("For %s data (%d rows, %d columns):", d, data_dim[[1]], data_dim[[2]]))
+  na_cols = summarise_all(current_data, ~ mean(is.na(.)))
+  na_stats = table(t(na_cols)[,1])
+  for (i in 1:length(na_stats)) {
+    print(sprintf(
+      "...there are %s columns where %s%% are NA",
+      toString(na_stats[i]),
+      as.numeric(names(na_stats[i]))*100
+      ))
+  }
+  if (d == "training") {
+    no_na_cols_training = names(na_cols)[which(t(na_cols) == 0)]
+  }
+  else {
+    no_na_cols_testing = names(na_cols)[which(t(na_cols) == 0)]
+    print("Good (0 na columns) in training data that are not good in testing data:")
+    print(setdiff(no_na_cols_training, no_na_cols_testing))
+    print("Good (0 na columns) in testing data that are not good in training data:")
+    print(setdiff(no_na_cols_testing, no_na_cols_training))
+  }
+}
+```
+There is a clear pattern here, with a bunch of columns that are almost entirely NA in the training data.
+These same columns are 100% NA in the testing data.
+Probably we can ignore those columns, but is there something special about the few non-NA entries in those columns?
+
+#### Look at row NAs
+```{r}
+complete_rows = complete.cases(training_data)
+print(sprintf(
+  "Training data has %f%% of rows with some NAs",
+  100*(1 - sum(complete_rows)/nrow(training_data))
+))
+```
+The percentage of rows with some NAs is identical to what we saw for columns.
+So, the NAs are all "grouped together",
+i.e. a row has either all NA or zero NA in those columns.
+I am going to treat those rows with no NAs as invalid and get rid of them,
+since they do not match the structure of the testing data we have to predict on.
+
+(They appear to be rows that include window aggregations of some kind.
+They are probably all the rows with "new_window" = "yes", but it's not worth checking.)
+
+# Clean up the data
+
+#### Drop NA columns
+Have a look at the training data after as a sanity check.
+```{r}
+training_data_clean = training_data %>%
+  filter(!complete_rows) %>%
+  select(all_of(no_na_cols_training))
+testing_data_clean = testing_data %>%
+  select(all_of(no_na_cols_testing))
+glimpse(training_data_clean)
+```
+
+#### Drop non-feature columns
+We can see some non-feature columns in the above data, so remove them.
+```{r}
+more_cols_to_remove = c(
+  "user_name",
+  "raw_timestamp_part_1",
+  "raw_timestamp_part_2",
+  "cvtd_timestamp",
+  "new_window",
+  "num_window"
+  )
+training_data_cleanest = select(training_data_clean, -all_of(more_cols_to_remove))
+```
+
+#### Format target variable as factor
+```{r}
+training_data_cleanest$classe = as.factor(training_data_cleanest$classe)
+```
+
+#### Split training and validation data
+Since the final data I have to predict on is called "testing data",
+I will call my holdout data for training "validation data".
+```{r}
+set.seed(42)
+inTrainSet = createDataPartition(training_data_cleanest$classe, p=0.8, list=FALSE)
+train_set = training_data_cleanest[inTrainSet,]
+val_set = training_data_cleanest[-inTrainSet,]
+```
+
+#### Look at target variable
+```{r}
+barplot(table(train_set$classe), xlab="Target ('classe')", ylab="N rows")
+```
+
+# Train and evaluate models
+
+#### Random guess baseline
+Start with a very basic model that makes a random guess.
+It is weighted by how often each class comes up, but that's all.
+Notice the baseline accuracy, just a little better than 1/5 for 5 classes.
+```{r}
+random_guess_predictions = function(df_to_predict) {
+  random_guess_model_weights = table(train_set$classe)
+  set.seed(42)
+  preds = slice_sample(
+    data.frame(names(random_guess_model_weights)),
+    n = nrow(df_to_predict),
+    weight_by = as.numeric(random_guess_model_weights),
+    replace = TRUE
+  )
+  names(preds) = c("classe")
+  preds$classe = as.factor(preds$classe)
+  return(preds)
+}
+cm = confusionMatrix(
+  random_guess_predictions(train_set)$classe,
+  train_set$classe
+)
+print(cm$table)
+print(cm$overall["Accuracy"])
+```
+
+#### Random forest on subset of rows
+Random Forests are a good general purpose algorithm with few assumptions about the data,
+so no need to do a bunch more cleanup/preprocessing (scaling etc).
+Training time on the full data with all defaults (including tuning, etc) was slow,
+so I want to try some things on a reduced set first and see if I can speed it up.
+
+Using out-of-bag instead of other cross-validation methods here because it is fast,
+and just for fun based on the options in the documentation.
+I tried other methods as well (e.g. "cv" instead of "oob"),
+but not including that code here to keep knitting time reasonable.
+https://topepo.github.io/caret/model-training-and-tuning.html#the-traincontrol-function
+```{r}
+reduced_train_set = slice_sample(train_set, n=1000)
+t1 = Sys.time()
+first_model = train(
+  classe ~ .,
+  data=reduced_train_set,
+  method='rf',
+  tuneGrid=expand.grid(mtry=c(5,10,20)),
+  trControl = trainControl(method = "oob")
+  )
+print(Sys.time() - t1)
+```
+
+Look at the results, notice there is not much difference.
+I will stick to mtry=5 for future training to save time.
+```{r}
+first_model
+```
+
+#### Random forest on subset of rows and subset of columns
+Can I pick out the most important features to further reduce training time?
+That would be nice when I get to the full sample,
+in case I want to return to hyperparameter tuning,
+or quickly try other models on a reduced list of features
+(without sacrificing too much in accuracy).
+This is also an excuse to play with k-fold cross-validation a bit manually.
+```{r}
+use_cols = row.names(varImp(first_model$finalModel))
+n_feature_grid = c(5, 10, 20, 40, 50)
+accuracy_grid = c()
+set.seed(42)
+folds = createFolds(reduced_train_set$classe, k=3, list=TRUE, returnTrain=TRUE)
+folds_accuracy = c()
+for (i in 1:length(n_feature_grid)) {
+  n_features = n_feature_grid[[i]]
+  print(sprintf("Trying with %d features", n_features))
+  t1 = Sys.time()
+  current_accuracy = c()
+  for (j in 1:length(folds)) {
+    current_data = reduced_train_set %>%
+      select(all_of(c(use_cols[1:n_features], "classe")))
+    current_model = train(
+      classe ~ .,
+      data=current_data[folds[[j]],],
+      method='rf',
+      tuneGrid=data.frame(mtry=5),
+      trControl = trainControl(method = "none"))
+    cm = confusionMatrix(
+      predict(current_model, current_data[-folds[[j]],]),
+      current_data[-folds[[j]],]$classe
+    )
+    current_accuracy = c(current_accuracy, as.numeric(cm$overall["Accuracy"]))
+  }
+  print(Sys.time() - t1)
+  accuracy_grid = c(accuracy_grid, mean(current_accuracy))
+  folds_accuracy = c(folds_accuracy, current_accuracy)
+}
+plot(rep(n_feature_grid, each=3), folds_accuracy, xlab="N features", ylab="Accuracy")
+lines(n_feature_grid, accuracy_grid)
+```
+
+Ok, it seems that the accuracy keeps going up and we need all the features.
+
+#### Random forest on full training set
+Now train on the whole training set.
+```{r}
+print("Training on the whole train set")
+t1 = Sys.time()
+full_model = train(
+  classe ~ .,
+  data=train_set,
+  method='rf',
+  tuneGrid=data.frame(mtry=5),
+  trControl = trainControl(method = "none"))
+print(Sys.time() - t1)
+```
+
+#### In vs out of sample error
+Let's actually look at both in and out of sample error here.
+Notice the overfitting on the training data!
+Still, out-of-sample error is also very good -
+this 99% is much better than the 90% or so I was getting on the reduced data set.
+So, I think I am done here.
+```{r}
+cm_train = confusionMatrix(predict(full_model, train_set), train_set$classe)
+print(sprintf("Train accuracy: %f", as.numeric(cm_train$overall["Accuracy"])))
+cm_val = confusionMatrix(predict(full_model, val_set), val_set$classe)
+print(sprintf("Validation accuracy: %f", as.numeric(cm_val$overall["Accuracy"])))
+```
+
+# Get the final test predictions
+
+```{r}
+preds_to_save = select(testing_data_clean, "problem_id")
+preds_to_save$pred = predict(full_model, testing_data_clean)
+write.csv(preds_to_save, "/mnt/PracticalMachineLearning/Week4project_preds.csv", row.names = FALSE)
+preds_to_save
+```
